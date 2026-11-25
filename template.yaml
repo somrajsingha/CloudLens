@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CloudLens serverless upload, image processing, OCR, and file history
+
+Parameters:
+  FrontendOrigin:
+    Type: String
+    Description: Exact frontend origin, for example https://app.example.com
+  CallbackUrl:
+    Type: String
+    Description: Frontend OAuth callback URL, for example https://app.example.com/
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref FilesTable
+        RAW_BUCKET: !Ref RawBucket
+        PROCESSED_BUCKET: !Ref ProcessedBucket
+        NOTIFICATION_TOPIC_ARN: !Ref NotificationsTopic
+        ALLOWED_ORIGIN: !Ref FrontendOrigin
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admins
+      UserPoolId: !Ref UserPool
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs: [!Ref CallbackUrl]
+      LogoutURLs: [!Ref CallbackUrl]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: owner, AttributeType: S}
+        - {AttributeName: fileId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: owner, KeyType: HASH}
+        - {AttributeName: fileId, KeyType: RANGE}
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-raw'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref FrontendOrigin]
+            AllowedMethods: [PUT]
+            AllowedHeaders: ['*']
+            MaxAge: 300
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowOrigin: !Sub "'${FrontendOrigin}'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      CodeUri: backend/
+      Handler: api.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref FilesTable}
+        - S3ReadPolicy: {BucketName: !Ref RawBucket}
+        - S3ReadPolicy: {BucketName: !Ref ProcessedBucket}
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:DeleteObject]
+              Resource: !Sub '${RawBucket.Arn}/*'
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub '${ProcessedBucket.Arn}/*'
+      Events:
+        UploadUrl: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /upload-url, Method: POST}}
+        Files: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /files, Method: GET}}
+        File: {Type: Api, Properties: {RestApiId: !Ref Api, Path: '/files/{fileId}', Method: GET}}
+        Delete: {Type: Api, Properties: {RestApiId: !Ref Api, Path: '/files/{fileId}', Method: DELETE}}
+        Download: {Type: Api, Properties: {RestApiId: !Ref Api, Path: '/files/{fileId}/download', Method: GET}}
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      Dockerfile: Dockerfile.processor
+      DockerContext: ./backend
+      DockerTag: v1
+    Properties:
+      PackageType: Image
+      Architectures: [x86_64]
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FilesTable
+          RAW_BUCKET: !Sub '${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-raw'
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationsTopic
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref FilesTable}
+        - S3ReadPolicy: {BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-${AWS::Region}-raw'}
+        - S3WritePolicy: {BucketName: !Ref ProcessedBucket}
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref NotificationsTopic
+      Events:
+        NewUpload:
+          Type: S3
+          Properties: {Bucket: !Ref RawBucket, Events: s3:ObjectCreated:*}
+
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      CodeUri: backend/
+      Handler: admin.handler
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref FilesTable}
+      Events:
+        Metrics: {Type: Api, Properties: {RestApiId: !Ref Api, Path: /admin/metrics, Method: GET}}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  NotificationsTopicArn:
+    Value: !Ref NotificationsTopic

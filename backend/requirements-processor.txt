@@ -1,0 +1,4 @@
+boto3==1.44.3
+Pillow==11.3.0
+pypdfium2==5.15.2
+awslambdaric==4.2.3
